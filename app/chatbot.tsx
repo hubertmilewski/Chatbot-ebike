@@ -276,7 +276,7 @@ export default function ChatBot() {
                 style={{ overflow: "hidden" }}
               >
                 {/* Messages */}
-                <div className="h-[50vh] overflow-y-auto p-4 space-y-4 bg-gray-800">
+                <div className="h-[50vh] overflow-y-auto p-4 space-y-4 bg-gray-800 scrollbar-hide">
                   {messages.map((message) => (
                     <motion.div
                       key={message.id}
