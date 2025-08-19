@@ -4,11 +4,17 @@ import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Send, User, Minus, Bot, MessageCircle } from "lucide-react";
 
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
+
 interface Message {
   id: string;
   text: string;
   isUser: boolean;
   timestamp: Date;
+  // NEW: optional quick replies from n8n
+  suggestions?: string[];
 }
 
 export default function ChatBot() {
@@ -46,17 +52,59 @@ export default function ChatBot() {
   };
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      setShowInitialMessage(true);
-    }, 3000);
+    const timer = setTimeout(() => setShowInitialMessage(true), 3000);
     return () => clearTimeout(timer);
   }, []);
 
   useEffect(() => {
-    if (isOpen && !isMinimized) {
-      scrollToBottom();
-    }
+    if (isOpen && !isMinimized) scrollToBottom();
   }, [messages, isOpen, isMinimized]);
+
+  // ---- Helpers to normalize n8n responses
+  const normalizeFromN8n = (d: any): { text: string; suggestions?: string[] } => {
+    const tryParse = (v: any) => {
+      if (typeof v !== "string") return v;
+      const s = v.trim();
+      if (!(s.startsWith("{") || s.startsWith("["))) return v;
+      try { return JSON.parse(s); } catch { return v; }
+    };
+
+    // peel off stringified layers and common wrappers
+    let o: any = tryParse(d);
+    if (o && typeof o === "object" && "body" in o) o = tryParse(o.body);
+    if (o && typeof o === "object" && "data" in o) o = tryParse(o.data);
+    if (o && typeof o === "object" && "output" in o) o = tryParse(o.output);
+
+    // now read fields
+    const text =
+      (o?.text ??
+        o?.message ??
+        o?.response ??
+        o?.output ??
+        (Array.isArray(o?.messages) ? o.messages.at(-1)?.message : undefined) ??
+        (typeof o === "string" ? o : undefined)) ?? "";
+
+    // gather suggestions from common keys
+    let suggestions: string[] | undefined;
+    const raw =
+      o?.suggestions ??
+      o?.quickReplies ??
+      o?.buttons ??
+      o?.choices ??
+      undefined;
+
+    if (Array.isArray(raw)) {
+      suggestions = raw
+        .map((x) =>
+          typeof x === "string"
+            ? x
+            : x?.title ?? x?.text ?? x?.label ?? x?.name
+        )
+        .filter(Boolean);
+    }
+
+    return { text: String(text), suggestions };
+  };
 
   useEffect(() => {
     const fetchHistory = async () => {
@@ -72,17 +120,22 @@ export default function ChatBot() {
         const history = Array.isArray(data?.messages) ? data.messages : [];
         if (!history.length) return;
 
-        const normalized = history.map((m: any, idx: number) => ({
-          id: `h-${idx}`,
-          text: m?.message ?? m?.text ?? m?.content ?? JSON.stringify(m),
-          isUser: (m?.sender ?? m?.role) === "user",
-          timestamp: new Date(),
-        }));
+        const normalized = history.map((m: any, idx: number) => {
+          const { text, suggestions } = normalizeFromN8n(m);
+          return {
+            id: `h-${idx}`,
+            text,
+            suggestions,
+            isUser: (m?.sender ?? m?.role) === "user",
+            timestamp: new Date(),
+          } as Message;
+        });
         setMessages((prev) => {
           const keepGreeting = prev?.length ? prev.slice(0, 1) : [];
           return [...keepGreeting, ...normalized];
         });
       } catch {
+        // ignore
       }
     };
     fetchHistory();
@@ -104,59 +157,62 @@ export default function ChatBot() {
           [SESSION_KEY]: getSessionId(),
         }),
       });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
       const data = await response.json();
-
-      const extractText = (d: any): string | undefined => {
-        if (!d) return undefined;
-        if (typeof d === "string") return d;
-        return (
-          d.text ??
-          d.message ??
-          d.response ??
-          d.output ??
-          d.data ??
-          (Array.isArray(d?.messages) ? d.messages.at(-1)?.message : undefined)
-        );
-      };
-
-      return extractText(data) ?? "Sorry, I couldn't read the response.";
+      return normalizeFromN8n(data);
     } catch (error) {
-      console.error("Błąd n8n:", error);
-      return "There was an error talking to the server.";
+      console.error("n8n error:", error);
+      return { text: "There was an error talking to the server." };
     }
   };
 
-  const handleSendMessage = async () => {
-    if (!inputValue.trim()) return;
+  const sendNow = async (content: string) => {
+    if (!content.trim()) return;
 
-    const newMessage: Message = {
-      id: Date.now().toString(),
-      text: inputValue,
+    const userMessage: Message = {
+      id: String(Date.now()),
+      text: content,
       isUser: true,
       timestamp: new Date(),
     };
 
-    setMessages((prev) => [...prev, newMessage]);
-    const messageText = inputValue;
-    setInputValue("");
+    setMessages((prev) => [...prev, userMessage]);
     setIsTyping(true);
 
-    const responseText = await sendMessageToN8n(messageText);
+    const res = await fetch(`${WEBHOOK_URL}?action=sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [CHAT_INPUT_KEY]: content, [SESSION_KEY]: getSessionId() }),
+    });
 
-    const aiMessage: Message = {
-      id: (Date.now() + 1).toString(),
-      text: responseText,
+    let parsed: { text: string; suggestions?: string[] };
+    try {
+      parsed = normalizeFromN8n(await res.json());
+    } catch {
+      parsed = { text: "There was an error talking to the server." };
+    }
+
+    const botMessage: Message = {
+      id: String(Date.now() + 1),
+      text: parsed.text,
+      suggestions: parsed.suggestions,
       isUser: false,
       timestamp: new Date(),
     };
 
-    setMessages((prev) => [...prev, aiMessage]);
+    setMessages((prev) => [...prev, botMessage]);
     setIsTyping(false);
+  };
+
+  const handleSendMessage = async () => {
+    const msg = inputValue;
+    setInputValue("");
+    await sendNow(msg);
+  };
+
+  const handleQuickReply = async (suggestion: string) => {
+    await sendNow(suggestion);
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -171,7 +227,6 @@ export default function ChatBot() {
     setIsMinimized(false);
     setShowInitialMessage(false);
   };
-
   const closeMessage = () => setShowInitialMessage(false);
   const minimizeChat = () => setIsMinimized(true);
   const maximizeChat = () => setIsMinimized(false);
@@ -180,11 +235,11 @@ export default function ChatBot() {
     setIsMinimized(false);
   };
 
+  // ---- UI
   return (
     <>
       <div id="hidden-n8n-chat" style={{ display: "none" }} />
-      <div className="fixed bottom-6 right-6 z-50 flex flex-col items-end">
-
+      <div className="fixed bottom-6 right-4 md:right-6 z-50 flex flex-col items-end">
         {/* Initial Message Bubble */}
         <AnimatePresence>
           {showInitialMessage && !isOpen && (
@@ -193,7 +248,7 @@ export default function ChatBot() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 10, scale: 0.95 }}
               transition={{ duration: 0.3, ease: "easeOut" }}
-              className="mb-4 mr-2 max-w-sm"
+              className="mb-4 max-w-sm"
             >
               <div className="bg-gray-800 text-gray-200 rounded-2xl rounded-br-sm shadow-xl p-4 relative border border-gray-600">
                 <div className="flex items-center justify-between mb-2">
@@ -201,10 +256,7 @@ export default function ChatBot() {
                     <div className="w-2 h-2 rounded-full bg-green-500"></div>
                     <span className="text-sm font-semibold text-gray-300">Bailey is online</span>
                   </div>
-                  <button
-                    onClick={closeMessage}
-                    className="hover:bg-gray-700 rounded-full p-1 transition-colors"
-                  >
+                  <button onClick={closeMessage} className="hover:bg-gray-700 rounded-full p-1 transition-colors">
                     <X className="w-4 h-4 text-gray-400" />
                   </button>
                 </div>
@@ -225,7 +277,7 @@ export default function ChatBot() {
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 20 }}
               transition={{ duration: 0.2, ease: "easeOut" }}
-              className="fixed bottom-6 right-4 w-120 max-w-[calc(100vw-2rem)] bg-gray-900 rounded-2xl shadow-2xl border border-gray-700 overflow-hidden"
+              className="fixed bottom-6 right-4 w-150 max-w-[calc(100vw-2rem)] bg-gray-900 rounded-2xl shadow-2xl border border-gray-700 overflow-hidden"
             >
               {/* Header */}
               <div
@@ -248,7 +300,7 @@ export default function ChatBot() {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      isMinimized ? maximizeChat() : minimizeChat();
+                      isMinimized ? maximizeChat() : setIsMinimized(true);
                     }}
                     className="p-2 hover:bg-white/10 rounded-lg transition-colors"
                   >
@@ -266,17 +318,14 @@ export default function ChatBot() {
                 </div>
               </div>
 
-              {/* Messages and Input */}
+              {/* Messages + Input */}
               <motion.div
-                animate={{
-                  height: isMinimized ? 0 : "auto",
-                  opacity: isMinimized ? 0 : 1,
-                }}
+                animate={{ height: isMinimized ? 0 : "auto", opacity: isMinimized ? 0 : 1 }}
                 transition={{ duration: 0.3, ease: "easeInOut" }}
                 style={{ overflow: "hidden" }}
               >
                 {/* Messages */}
-                <div className="h-[50vh] overflow-y-auto p-4 space-y-4 bg-gray-800 scrollbar-hide">
+                <div className="h-[60vh] overflow-y-auto p-4 space-y-4 bg-gray-800 scrollbar-hide">
                   {messages.map((message) => (
                     <motion.div
                       key={message.id}
@@ -285,39 +334,56 @@ export default function ChatBot() {
                       transition={{ duration: 0.2 }}
                       className={`flex ${message.isUser ? "justify-end" : "justify-start"}`}
                     >
-                      <div
-                        className={`flex items-start space-x-2 max-w-[80%] ${message.isUser ? "flex-row-reverse space-x-reverse" : ""
-                          }`}
-                      >
+                      <div className={`flex items-start space-x-2 max-w-[80%] ${message.isUser ? "flex-row-reverse space-x-reverse" : ""}`}>
                         <div
-                          className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.isUser
-                            ? "bg-blue-600"
-                            : "bg-gray-600"
+                          className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${message.isUser ? "bg-blue-600" : "bg-gray-600"
                             }`}
                         >
-                          {message.isUser ? (
-                            <User className="w-4 h-4 text-white" />
-                          ) : (
-                            <Bot className="w-4 h-4 text-gray-300" />
-                          )}
+                          {message.isUser ? <User className="w-4 h-4 text-white" /> : <Bot className="w-4 h-4 text-gray-300" />}
                         </div>
+
                         <div className="flex flex-col space-y-1">
                           <div
-                            className={`rounded-2xl px-4 py-2 ${message.isUser
-                              ? "bg-blue-600 text-white"
-                              : "bg-gray-700 text-gray-200 border border-gray-600"
+                            className={`rounded-2xl px-4 py-2 ${message.isUser ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-200 border border-gray-600"
                               }`}
                           >
-                            <p className="text-sm leading-relaxed">{message.text}</p>
+                            {message.isUser ? (
+                              <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">{message.text}</p>
+                            ) : (
+                              <div className="prose prose-invert max-w-none text-sm">
+                                <ReactMarkdown
+                                  remarkPlugins={[remarkGfm]}
+                                  rehypePlugins={[rehypeSanitize]}
+                                  components={{
+                                    p: (props) => <p className="leading-relaxed" {...props} />,
+                                    ul: (props) => <ul className="list-disc ml-5 my-2" {...props} />,
+                                    ol: (props) => <ol className="list-decimal ml-5 my-2" {...props} />,
+                                    li: (props) => <li className="my-1" {...props} />,
+                                  }}
+                                >
+                                  {(message.text || "").replace(/\\n/g, "\n")}
+                                </ReactMarkdown>
+                              </div>
+                            )}
                           </div>
-                          <p
-                            className={`text-xs px-2 text-gray-400 ${message.isUser ? "text-right" : "text-left"
-                              }`}
-                          >
-                            {message.timestamp.toLocaleTimeString([], {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
+
+                          {/* NEW: Quick replies */}
+                          {!message.isUser && Array.isArray(message.suggestions) && message.suggestions.length > 0 && (
+                            <div className="flex flex-wrap gap-2 mt-1">
+                              {message.suggestions.map((s, i) => (
+                                <button
+                                  key={`${message.id}-s-${i}`}
+                                  onClick={() => handleQuickReply(s)}
+                                  className="text-xs px-3 py-1 rounded-full border border-blue-400/40 bg-blue-500/10 text-blue-200 hover:bg-blue-500/20 transition-colors"
+                                >
+                                  {s}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          <p className={`text-xs px-2 text-gray-400 ${message.isUser ? "text-right" : "text-left"}`}>
+                            {message.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                           </p>
                         </div>
                       </div>
@@ -326,11 +392,7 @@ export default function ChatBot() {
 
                   {/* Typing Indicator */}
                   {isTyping && (
-                    <motion.div
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="flex justify-start"
-                    >
+                    <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex justify-start">
                       <div className="flex items-start space-x-2">
                         <div className="w-8 h-8 rounded-full bg-gray-600 flex items-center justify-center">
                           <Bot className="w-4 h-4 text-gray-300" />
