@@ -62,11 +62,40 @@ export default function ChatBot() {
 
   // ---- Helpers to normalize n8n responses
   const normalizeFromN8n = (d: any): { text: string; suggestions?: string[] } => {
+    // Robust JSON-string parser (handles BOM, code fences, extra text)
     const tryParse = (v: any) => {
       if (typeof v !== "string") return v;
-      const s = v.trim();
-      if (!(s.startsWith("{") || s.startsWith("["))) return v;
-      try { return JSON.parse(s); } catch { return v; }
+
+      // 1) strip BOM + trim
+      let s = v.replace(/^\uFEFF/, "").trim();
+
+      // 2) unwrap ``` or ```json fences if present
+      const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i;
+      const m = s.match(fence);
+      if (m) s = m[1].trim();
+
+      // 3) if not starting with { or [, try to extract the first JSON-ish block
+      if (!(s.startsWith("{") || s.startsWith("["))) {
+        const firstBrace = s.search(/[{\[]/);
+        if (firstBrace !== -1) {
+          s = s.slice(firstBrace);
+        }
+      }
+
+      // 4) attempt parse; if it fails, progressively trim the tail until it succeeds
+      // (helps when extra characters trail after the JSON)
+      let end = s.length;
+      for (; end > 1; end--) {
+        const candidate = s.slice(0, end).trim();
+        try {
+          if (candidate.startsWith("{") || candidate.startsWith("[")) {
+            return JSON.parse(candidate);
+          }
+        } catch {
+          // keep shrinking
+        }
+      }
+      return v; // give up -> return original
     };
 
     // peel off stringified layers and common wrappers
@@ -75,33 +104,30 @@ export default function ChatBot() {
     if (o && typeof o === "object" && "data" in o) o = tryParse(o.data);
     if (o && typeof o === "object" && "output" in o) o = tryParse(o.output);
 
-    // now read fields
+    // text
     const text =
       (o?.text ??
         o?.message ??
         o?.response ??
         o?.output ??
         (Array.isArray(o?.messages) ? o.messages.at(-1)?.message : undefined) ??
-        (typeof o === "string" ? o : undefined)) ?? "";
+        (typeof o === "string" ? o : undefined) ??
+        "") as string;
 
-    // gather suggestions from common keys
-    let suggestions: string[] | undefined;
+    // suggestions from common keys
     const raw =
       o?.suggestions ??
       o?.quickReplies ??
       o?.buttons ??
-      o?.choices ??
-      undefined;
+      o?.choices;
 
-    if (Array.isArray(raw)) {
-      suggestions = raw
-        .map((x) =>
-          typeof x === "string"
-            ? x
-            : x?.title ?? x?.text ?? x?.label ?? x?.name
+    const suggestions = Array.isArray(raw)
+      ? raw
+        .map((x: any) =>
+          typeof x === "string" ? x : x?.title ?? x?.text ?? x?.label ?? x?.name
         )
-        .filter(Boolean);
-    }
+        .filter(Boolean)
+      : undefined;
 
     return { text: String(text), suggestions };
   };
